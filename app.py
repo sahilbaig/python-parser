@@ -15,91 +15,60 @@ logging.getLogger("pdfminer").setLevel(logging.ERROR)
 app = Flask(__name__)
 CORS(app)
 
-# Increased chunk size to capture more context
-CHUNK_SIZE = 3000
+CHUNK_SIZE = 3000  # Adjust if needed
 
 def parse_pdf_chunk_with_ollama(text_chunk: str):
     prompt = f"""
-You are an expert at extracting exam directions and question descriptions from CAT exam PDFs.
+You are an expert at extracting exam directions from CAT exam PDFs.
 
-ANALYZE THIS TEXT AND EXTRACT ALL DIRECTION BLOCKS:
+ANALYZE THIS TEXT AND EXTRACT ONLY DIRECTION BLOCKS (ignore questions):
 
 {text_chunk}
 
 CRITICAL RULES:
-1. Extract ONLY the actual direction/description text blocks that appear before question sets
-2. For each block, identify the question range it applies to (e.g., "questions 1 to 5")
-3. Return valid JSON array with exact structure
-4. Use ONLY text found in the PDF - no placeholders
-5. Preserve the original wording and formatting
-
-REQUIRED JSON FORMAT:
-[
-  {{
+1. Only extract blocks that start with "DIRECTIONS"
+2. Identify the question range it applies to (e.g., "questions 1 to 5")
+3. Return each direction block as a JSON object (not array) with this format:
+{{
     "type": "description",
     "from": 1,
     "to": 5,
-    "text": "DIRECTIONS for questions 1 to 5: Each of the following questions has one or more blank spaces..."
-  }}
-]
+    "text": "..."
+}}
+4. Use ONLY text found in the PDF
+5. Preserve original wording and formatting
 
-If no directions are found, return empty array: []
+If no directions are found, return empty object(s).
 """
     try:
         response = generate("llama2:latest", prompt)
         return response['response']
     except Exception as e:
         print(f"Ollama generation error: {e}")
-        return "[]"
+        return ""
 
 def extract_and_validate_json(output: str):
-    """More robust JSON extraction and validation"""
-    # Clean the output
-    cleaned = output.strip()
-    
-    # Remove any text before the first [ and after the last ]
-    start_idx = cleaned.find('[')
-    end_idx = cleaned.rfind(']')
-    
-    if start_idx == -1 or end_idx == -1:
-        return []
-    
-    json_str = cleaned[start_idx:end_idx+1]
-    
-    try:
-        # Try to parse the JSON directly first
-        parsed = json.loads(json_str)
-        
-        # Validate structure
-        if isinstance(parsed, list):
-            validated_items = []
-            for item in parsed:
-                # Check if item has required fields with correct types
-                if (isinstance(item, dict) and 
-                    'type' in item and 
-                    'from' in item and 
-                    'to' in item and 
-                    'text' in item and
-                    isinstance(item['from'], int) and
-                    isinstance(item['to'], int)):
-                    validated_items.append(item)
-            return validated_items
-        return []
-    except json.JSONDecodeError:
-        # Try to fix common JSON issues
-        try:
-            # Remove trailing commas
-            json_str = re.sub(r',\s*}', '}', json_str)
-            json_str = re.sub(r',\s*]', ']', json_str)
-            # Fix unquoted keys
-            json_str = re.sub(r'(\s*)(\w+)(\s*):', r'\1"\2"\3:', json_str)
-            parsed = json.loads(json_str)
-            return parsed if isinstance(parsed, list) else []
-        except:
-            return []
+    """Extract all JSON objects from Ollama output and return valid direction blocks."""
+    # Match all {...} objects
+    objects = re.findall(r'\{.*?\}', output, re.DOTALL)
+    validated_items = []
 
-@app.route("/all-questions", methods=["POST"])
-def pdf_text():
+    for obj_str in objects:
+        try:
+            parsed = json.loads(obj_str)
+            if (isinstance(parsed, dict) and
+                parsed.get("type") == "description" and
+                isinstance(parsed.get("from"), int) and
+                isinstance(parsed.get("to"), int) and
+                isinstance(parsed.get("text"), str)):
+                validated_items.append(parsed)
+        except json.JSONDecodeError:
+            continue
+
+    return validated_items
+
+@app.route("/directions-only", methods=["POST"])
+def pdf_directions():
     try:
         data = request.get_json()
         url = data.get("url")
@@ -111,17 +80,19 @@ def pdf_text():
         response.raise_for_status()
         pdf_file = BytesIO(response.content)
 
-        # Extract text from first few pages (where directions usually are)
+        # Extract text from first few pages
         full_text = ""
         with pdfplumber.open(pdf_file) as pdf:
-            for i, page in enumerate(pdf.pages[:3]):  # First 3 pages
+            for page in pdf.pages[:3]:
                 page_text = page.extract_text()
                 if page_text:
                     full_text += page_text + "\n"
                 if len(full_text) > CHUNK_SIZE:
                     break
 
-        chunk = full_text[:CHUNK_SIZE]
+        # Focus only from first occurrence of "DIRECTIONS"
+        start_idx = full_text.find("DIRECTIONS")
+        chunk = full_text[start_idx:start_idx + CHUNK_SIZE] if start_idx != -1 else full_text[:CHUNK_SIZE]
         print(f"Processing text chunk: {chunk[:200]}...")
 
         # Send to Ollama
@@ -130,10 +101,10 @@ def pdf_text():
 
         # Extract and validate JSON
         parsed_data = extract_and_validate_json(raw_output)
-        
+
         return jsonify({
             "success": True,
-            "descriptions": parsed_data,
+            "directions": parsed_data,
             "chunk_preview": chunk[:200] + "..." if len(chunk) > 200 else chunk
         }), 200
 
@@ -141,5 +112,122 @@ def pdf_text():
         print("Error parsing PDF:", e)
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/questions-only", methods=["POST"])
+def pdf_questions():
+    try:
+        data = request.get_json()
+        url = data.get("url")
+        if not url:
+            return jsonify({"error": "PDF URL is required"}), 400
+
+        # Download PDF
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        pdf_file = BytesIO(response.content)
+
+        # Extract text from first few pages
+        full_text = ""
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages[:5]:
+                page_text = page.extract_text()
+                if page_text:
+                    full_text += page_text + "\n"
+                if len(full_text) > 5000:
+                    break
+
+        # Find the start of questions section
+        start_idx = full_text.find("1.")
+        if start_idx == -1:
+            return jsonify({"error": "No questions found in PDF"}), 404
+            
+        chunk = full_text[start_idx:start_idx + 4000]
+        print(f"Processing questions chunk: {chunk[:200]}...")
+
+        # Send to Ollama for extraction
+        raw_output = parse_questions_with_ollama(chunk)
+        print("Ollama output:", raw_output[:500] + "..." if len(raw_output) > 500 else raw_output)
+
+        # Extract and validate JSON
+        parsed_questions = extract_and_validate_json(raw_output)
+
+        return jsonify({
+            "success": True,
+            "questions": parsed_questions,
+            "chunk_preview": chunk[:200] + "..." if len(chunk) > 200 else chunk
+        }), 200
+
+    except Exception as e:
+        print("Error parsing PDF questions:", e)
+        return jsonify({"error": str(e)}), 500
+
+def parse_questions_with_ollama(chunk):
+    """Send text chunk to Ollama for question extraction"""
+    prompt = f"""
+    TASK: Extract all numbered questions and their multiple choice options from the text below.
+    FORMAT: Return ONLY valid JSON array, no other text.
+
+    INSTRUCTIONS:
+    1. Find all questions that start with numbers like "1.", "2.", etc.
+    2. For each question, extract the question text (remove option numbers 1., 2., 3., 4.)
+    3. Map the options to a, b, c, d (1. → a, 2. → b, 3. → c, 4. → d)
+    4. Ignore any metadata, tables, or non-question content
+
+    REQUIRED JSON FORMAT:
+    [
+      {{
+        "number": 1,
+        "text": "clean question text here",
+        "options": {{
+          "a": "option text from 1.",
+          "b": "option text from 2.", 
+          "c": "option text from 3.",
+          "d": "option text from 4."
+        }}
+      }}
+    ]
+
+    TEXT TO PROCESS:
+    {chunk}
+
+    NOW EXTRACT THE QUESTIONS AND RETURN ONLY JSON:
+    """
+    
+    response = generate("llama2:latest", prompt)
+    return response['response']
+
+def extract_and_validate_json(raw_output):
+    """Extract JSON from Ollama output and validate it"""
+    try:
+        # Clean the output first
+        cleaned_output = raw_output.strip()
+        
+        # Remove any markdown code blocks
+        cleaned_output = re.sub(r'```json|```', '', cleaned_output)
+        
+        # Try to find JSON array
+        json_match = re.search(r'\[\s*\{.*?\}\s*\]', cleaned_output, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+        
+        # Try to find individual objects
+        objects = re.findall(r'\{\s*.*?"number".*?"text".*?"options".*?\}', cleaned_output, re.DOTALL)
+        if objects:
+            questions = []
+            for obj in objects:
+                try:
+                    questions.append(json.loads(obj))
+                except json.JSONDecodeError:
+                    continue
+            return questions
+            
+        print(f"No valid JSON found in output: {cleaned_output[:200]}...")
+        return []
+        
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {e}")
+        print(f"Raw output: {raw_output[:200]}...")
+        return []
+    
 if __name__ == "__main__":
     app.run(port=4000, debug=True)
