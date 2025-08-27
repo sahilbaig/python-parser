@@ -3,180 +3,78 @@ from flask_cors import CORS
 import pdfplumber
 import requests
 from io import BytesIO
-import logging
-from ollama import generate
-import json
 import re
-import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning)
-logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 app = Flask(__name__)
 CORS(app)
 
-CHUNK_SIZE = 3000  # Adjust if needed
+def extract_section_names(text):
+    """Extract section names like 'Section: VARC' or 'Section: Quantitative Ability'"""
+    pattern = r'Section:\s*([A-Za-z ]+)'
+    return [s.strip() for s in re.findall(pattern, text)]
 
-# ---------------------------
-# Ollama Helpers
-# ---------------------------
-def parse_pdf_chunk_with_ollama(text_chunk: str):
-    prompt = f"""
-You are an expert at extracting exam directions from CAT exam PDFs.
+def extract_questions_from_text(text):
+    """
+    Extract questions where:
+    - Question starts with Q. 1), Q. 2), etc.
+    - Question text spans multiple lines until a) appears
+    - Options a)-d) each on separate lines
+    """
+    question_pattern = r'Q\.\s*(\d+)\)\s*(.*?)\n(?=a\))'
+    questions = []
 
-ANALYZE THIS TEXT AND EXTRACT ONLY DIRECTION BLOCKS (ignore questions):
+    for match in re.finditer(question_pattern, text, re.DOTALL | re.MULTILINE):
+        q_num = int(match.group(1))
+        q_text = match.group(2).strip().replace('\n', ' ')
 
-{text_chunk}
+        # Extract options after question
+        options_pattern = r'^([a-d])\)\s*(.*)'
+        options_text = text[match.end():]
+        options = []
 
-CRITICAL RULES:
-1. Only extract blocks that start with "DIRECTIONS"
-2. Identify the question range it applies to (e.g., "questions 1 to 5")
-3. Return each direction block as a JSON object (not array) with this format:
-{{
-    "type": "description",
-    "from": 1,
-    "to": 5,
-    "text": "..."
-}}
-4. Use ONLY text found in the PDF
-5. Preserve original wording and formatting
+        for line in options_text.splitlines():
+            line = line.strip()
+            m = re.match(options_pattern, line)
+            if m:
+                letter, opt_text = m.groups()
+                options.append(f"{letter}) {opt_text.strip()}")
+            # Stop when next question starts
+            if re.match(r'^Q\.\s*\d+\)', line):
+                break
 
-IMPORTANT: Return ONLY JSON objects. Do NOT include explanations.
-"""
-    try:
-        response = generate("llama2:latest", prompt)
-        return response['response']
-    except Exception as e:
-        print(f"Ollama generation error: {e}")
-        return ""
+        if q_text and len(options) >= 2:
+            questions.append({
+                "question_number": q_num,
+                "question": q_text,
+                "options": options
+            })
 
-def parse_questions_with_ollama(chunk: str):
-    prompt = f"""
-TASK: Extract all numbered questions and their multiple choice options from the text below.
-FORMAT: Return ONLY valid JSON array, no other text.
+    return questions
 
-INSTRUCTIONS:
-1. Find all questions that start with numbers like "1.", "2.", etc.
-2. For each question, extract the question text (remove option numbers 1., 2., 3., 4.)
-3. Map the options to a, b, c, d (1. → a, 2. → b, 3. → c, 4. → d)
-4. Ignore any metadata, tables, or non-question content
+def extract_sections_with_questions(text):
+    """
+    Extract sections and their questions.
+    """
+    section_pattern = r'(Section:\s*[A-Za-z ]+)'
+    sections = re.split(section_pattern, text)
 
-REQUIRED JSON FORMAT:
-[
-  {{
-    "number": 1,
-    "text": "clean question text here",
-    "options": {{
-      "a": "option text from 1.",
-      "b": "option text from 2.", 
-      "c": "option text from 3.",
-      "d": "option text from 4."
-    }}
-  }}
-]
+    result = []
+    it = iter(sections)
+    first = next(it)  # may be text before first section
 
-TEXT TO PROCESS:
-{chunk}
+    for section_name in it:
+        section_text = next(it, "")
+        section_title = section_name.replace("Section:", "").strip()
+        questions = extract_questions_from_text(section_text)
+        result.append({
+            "section": section_title,
+            "questions": questions
+        })
 
-IMPORTANT: Return ONLY JSON array.
-"""
-    try:
-        response = generate("llama2:latest", prompt)
-        return response['response']
-    except Exception as e:
-        print(f"Ollama generation error: {e}")
-        return ""
+    return result
 
-# ---------------------------
-# JSON Extraction
-# ---------------------------
-def extract_json_objects(raw_text):
-    """Extract multiple JSON objects from Ollama output"""
-    matches = re.findall(r'\{.*?\}', raw_text, re.DOTALL)
-    valid_objects = []
-    for obj_str in matches:
-        try:
-            obj = json.loads(obj_str)
-            if isinstance(obj, dict) and "type" in obj and "from" in obj and "to" in obj and "text" in obj:
-                valid_objects.append(obj)
-        except json.JSONDecodeError:
-            continue
-    return valid_objects
-
-def extract_json_array(raw_text):
-    """Extract JSON array for questions"""
-    try:
-        cleaned = re.sub(r'```json|```', '', raw_text).strip()
-        array_match = re.search(r'\[\s*\{.*\}\s*\]', cleaned, re.DOTALL)
-        if array_match:
-            return json.loads(array_match.group())
-        # fallback: individual question objects
-        objects = re.findall(r'\{\s*.*?"number".*?"text".*?"options".*?\}', cleaned, re.DOTALL)
-        questions = []
-        for obj_str in objects:
-            try:
-                questions.append(json.loads(obj_str))
-            except:
-                continue
-        return questions
-    except Exception as e:
-        print("JSON parse error:", e)
-        return []
-
-# ---------------------------
-# PDF Helpers
-# ---------------------------
-def chunk_text(text, max_len=3500):
-    for i in range(0, len(text), max_len):
-        yield text[i:i + max_len]
-
-# ---------------------------
-# Flask Routes
-# ---------------------------
-@app.route("/directions-only", methods=["POST"])
-def pdf_directions():
-    try:
-        data = request.get_json()
-        url = data.get("url")
-        if not url:
-            return jsonify({"error": "PDF URL is required"}), 400
-
-        # Download PDF
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        pdf_file = BytesIO(response.content)
-
-        # Extract text from first few pages
-        full_text = ""
-        with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages[:3]:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
-                if len(full_text) > CHUNK_SIZE:
-                    break
-
-        start_idx = full_text.find("DIRECTIONS")
-        chunk = full_text[start_idx:start_idx + CHUNK_SIZE] if start_idx != -1 else full_text[:CHUNK_SIZE]
-        print(f"Processing text chunk: {chunk[:200]}...")
-
-        raw_output = parse_pdf_chunk_with_ollama(chunk)
-        print("Ollama output:", raw_output[:500] + "..." if len(raw_output) > 500 else raw_output)
-
-        parsed = extract_json_objects(raw_output)
-
-        return jsonify({
-            "success": True,
-            "directions": parsed,
-            "chunk_preview": chunk[:200] + "..." if len(chunk) > 200 else chunk
-        }), 200
-
-    except Exception as e:
-        print("Error parsing PDF:", e)
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/questions-only", methods=["POST"])
-def pdf_questions():
+@app.route("/extract-sections", methods=["POST"])
+def extract_sections():
     try:
         data = request.get_json()
         url = data.get("url")
@@ -189,37 +87,89 @@ def pdf_questions():
 
         full_text = ""
         with pdfplumber.open(pdf_file) as pdf:
-            for page in pdf.pages[:5]:
+            for page_num, page in enumerate(pdf.pages):
                 text = page.extract_text()
                 if text:
-                    full_text += text + "\n"
-                if len(full_text) > 5000:
-                    break
+                    full_text += f"=== PAGE {page_num + 1} ===\n" + text + "\n\n"
 
-        start_idx = full_text.find("1.")
-        if start_idx == -1:
-            return jsonify({"error": "No questions found in PDF"}), 404
-
-        chunk = full_text[start_idx:start_idx + 4000]
-        print(f"Processing questions chunk: {chunk[:200]}...")
-
-        raw_output = parse_questions_with_ollama(chunk)
-        print("Ollama output:", raw_output[:500] + "..." if len(raw_output) > 500 else raw_output)
-
-        parsed = extract_json_array(raw_output)
-
+        sections = extract_section_names(full_text)
+        
         return jsonify({
             "success": True,
-            "questions": parsed,
-            "chunk_preview": chunk[:200] + "..." if len(chunk) > 200 else chunk
+            "total_sections": len(sections),
+            "sections": sections,
+            "debug_info": {
+                "text_length": len(full_text),
+                "first_500_chars": full_text[:500] if len(full_text) > 500 else full_text
+            }
         }), 200
 
     except Exception as e:
-        print("Error parsing PDF questions:", e)
         return jsonify({"error": str(e)}), 500
 
-# ---------------------------
-# Run App
-# ---------------------------
+@app.route("/extract-questions", methods=["POST"])
+def extract_questions():
+    try:
+        data = request.get_json()
+        url = data.get("url")
+        if not url:
+            return jsonify({"error": "PDF URL is required"}), 400
+
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        pdf_file = BytesIO(response.content)
+
+        full_text = ""
+        with pdfplumber.open(pdf_file) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                if text:
+                    full_text += f"=== PAGE {page_num + 1} ===\n" + text + "\n\n"
+
+        questions = extract_questions_from_text(full_text)
+
+        return jsonify({
+            "success": True,
+            "total_questions": len(questions),
+            "questions": questions,
+            "debug_info": {
+                "text_length": len(full_text),
+                "first_500_chars": full_text[:500] if len(full_text) > 500 else full_text
+            }
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/extract-sections-questions", methods=["POST"])
+def extract_sections_questions():
+    try:
+        data = request.get_json()
+        url = data.get("url")
+        if not url:
+            return jsonify({"error": "PDF URL is required"}), 400
+
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        pdf_file = BytesIO(response.content)
+
+        full_text = ""
+        with pdfplumber.open(pdf_file) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                if text:
+                    full_text += f"=== PAGE {page_num + 1} ===\n" + text + "\n\n"
+
+        sections_with_questions = extract_sections_with_questions(full_text)
+
+        return jsonify({
+            "success": True,
+            "total_sections": len(sections_with_questions),
+            "sections": sections_with_questions
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     app.run(port=4000, debug=True)
